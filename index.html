@@ -1398,7 +1398,6 @@ let adminAuth={granted:false,branch:null};
 let cloudBootstrapping=false;
 const cloudSyncTimers={};
 const cloudRetryTimers={};
-const LOCAL_BRANCH_STATE_KEY='meridian_branch_state_v1';
 let lastLocalMutationAt=0;
 let lastCloudSyncAt=0;
 
@@ -1720,28 +1719,8 @@ function createEmptyBranchState(branch=selectedBranch){
 }
 const BRANCH_STATE=Object.fromEntries(BRANCHES.map(b=>[b,createEmptyBranchState(b)]));
 
-function persistBranchStateLocal(){
-  try{
-    localStorage.setItem(LOCAL_BRANCH_STATE_KEY,JSON.stringify(BRANCH_STATE));
-  }catch(e){}
-}
-function hydrateBranchStateLocal(){
-  const raw=localStorage.getItem(LOCAL_BRANCH_STATE_KEY);
-  if(!raw)return false;
-  try{
-    const parsed=JSON.parse(raw)||{};
-    let loaded=false;
-    BRANCHES.forEach(branch=>{
-      const st=parsed[branch];
-      if(!st||typeof st!=='object')return;
-      BRANCH_STATE[branch]=deep({...createEmptyBranchState(branch),...st});
-      loaded=true;
-    });
-    return loaded;
-  }catch(e){
-    return false;
-  }
-}
+function persistBranchStateLocal(){}
+function hydrateBranchStateLocal(){return false;}
 function scheduleCloudRetry(branch,attempt=1){
   if(!branch||cloudRetryTimers[branch])return;
   const wait=Math.min(60000,Math.max(5000,attempt*5000));
@@ -1756,7 +1735,7 @@ function clearCloudRetry(branch){
   clearTimeout(cloudRetryTimers[branch]);
   delete cloudRetryTimers[branch];
 }
-function queueCloudSync(branch=selectedBranch,delay=450){
+function queueCloudSync(branch=selectedBranch,delay=120){
   if(!branch)return;
   if(!supabaseClient)connectSupabase({silent:true});
   if(cloudSyncTimers[branch])clearTimeout(cloudSyncTimers[branch]);
@@ -1830,7 +1809,7 @@ function loadBranchState(branch,silent=false){
   applyPaymentConfig();
   updateShiftButton();
   refreshAllViews();
-  if(!silent)notify('Local activo','info',`Mostrando ${selectedBranch}`);
+  if(!silent)notify('Sucursal activa','info',`Mostrando ${selectedBranch}`);
 }
 async function changeBranch(branch){
   if(!branch||branch===selectedBranch)return;
@@ -1845,7 +1824,7 @@ async function changeBranch(branch){
   }finally{
     cloudBootstrapping=false;
   }
-  notify('Local activo','info',`Mostrando ${selectedBranch}`);
+  notify('Sucursal activa','info',`Mostrando ${selectedBranch}`);
   if(wasAdmin){
     setView('POS');
     setMobBtn('mobPOS');
@@ -2012,6 +1991,7 @@ async function saveConfig(){
   ensureSettings();
   captureConfigFromDom();
   let adminPwdChanged=false;
+  let expectedAdminHash=null;
   if(configTab==='general'){
     const cur=(document.getElementById('cfgAdminCurrent')?.value||'').trim();
     const next=(document.getElementById('cfgAdminNew')?.value||'').trim();
@@ -2025,6 +2005,7 @@ async function saveConfig(){
         return;
       }
       settings.general.adminPassHash=hashAdminPassword(next);
+      expectedAdminHash=settings.general.adminPassHash;
       adminPwdChanged=true;
       adminAuth={granted:false,branch:null};
     }
@@ -2039,7 +2020,17 @@ async function saveConfig(){
   checkTheftAlerts();
   saveCurrentBranchState();
   const synced=await syncBranchToSupabase({silent:true});
-  if(!synced)notify('Sync pendiente','warning','No se pudo guardar en nube en este momento');
+  if(!synced){
+    notify('No guardado','error','No se pudo sincronizar con Supabase');
+    return;
+  }
+  if(adminPwdChanged){
+    const ok=await verifyAdminHashInSupabase(expectedAdminHash);
+    if(!ok){
+      notify('No validado','error','Supabase no confirmó la nueva contraseña');
+      return;
+    }
+  }
   refreshAllViews();
   if(adminPwdChanged){
     setView('POS');
@@ -2157,7 +2148,7 @@ async function syncBranchToSupabase(opts={}){
   }
   clearCloudRetry(branch);
   lastCloudSyncAt=Date.now();
-  if(!silent)notify('Local sincronizado','success',branch);
+  if(!silent)notify('Sucursal sincronizada','success',branch);
   return true;
 }
 async function loadBranchFromSupabase(opts={}){
@@ -2201,9 +2192,8 @@ async function loadBranchFromSupabase(opts={}){
     return false;
   }
   BRANCH_STATE[branch]=deep({...createEmptyBranchState(branch),...payload});
-  persistBranchStateLocal();
   if(apply&&branch===selectedBranch)loadBranchState(branch,true);
-  if(!silent)notify('Local descargado','success',branch);
+  if(!silent)notify('Sucursal descargada','success',branch);
   return true;
 }
 async function bootstrapBranchesFromSupabase(){
@@ -2382,6 +2372,13 @@ function hasAdminPassword(){
   ensureSettings();
   return !!String(settings.general.adminPassHash||'').trim();
 }
+async function verifyAdminHashInSupabase(expectedHash){
+  const branch=selectedBranch;
+  const ok=await loadBranchFromSupabase({branch,silent:true,notifyMissing:false,apply:false});
+  if(!ok)return false;
+  const cloudHash=String(BRANCH_STATE[branch]?.settings?.general?.adminPassHash||'');
+  return cloudHash===String(expectedHash||'');
+}
 function openAdminAccessModal(){
   ensureSettings();
   const configured=hasAdminPassword();
@@ -2430,9 +2427,20 @@ async function createAdminAccess(){
   if(p1.length<4){notify('Contraseña débil','error','Debe tener al menos 4 caracteres');return;}
   if(p1!==p2){notify('No coincide','error','La confirmación de contraseña no coincide');return;}
   settings.general.adminPassHash=hashAdminPassword(p1);
+  const expectedHash=settings.general.adminPassHash;
   saveCurrentBranchState();
   const synced=await syncBranchToSupabase({silent:true});
-  if(!synced)notify('Sync pendiente','warning','La contraseña quedó local; reintenta sincronizar');
+  if(!synced){
+    settings.general.adminPassHash='';
+    saveCurrentBranchState({queueCloud:false});
+    notify('No guardada','error','No se pudo guardar la contraseña en Supabase');
+    return;
+  }
+  const verified=await verifyAdminHashInSupabase(expectedHash);
+  if(!verified){
+    notify('No validada','error','Supabase no confirmó la contraseña creada');
+    return;
+  }
   adminAuth={granted:true,branch:selectedBranch};
   closeModal();
   setView('ADMIN');
@@ -2441,7 +2449,7 @@ async function createAdminAccess(){
 function goView(v){
   if(v==='ADMIN'){
     if(cloudBootstrapping){
-      notify('Sincronizando local','info','Espera unos segundos antes de entrar a Administración');
+      notify('Sincronizando sucursal','info','Espera unos segundos antes de entrar a Administración');
       return false;
     }
     ensureSettings();
@@ -4520,7 +4528,6 @@ async function init(){
       if(parsed.url&&parsed.anonKey)supabaseCfg=parsed;
     }catch(e){}
   }
-  hydrateBranchStateLocal();
   hydrateSupabaseInputs();
   const connected=connectSupabase({silent:true});
   document.getElementById('branchSel').value=selectedBranch;
@@ -4534,7 +4541,7 @@ async function init(){
       cloudBootstrapping=false;
     }
     if(loaded){
-      notify('Datos cargados','success','Estado del local sincronizado desde Supabase');
+      notify('Datos cargados','success','Estado de sucursal sincronizado desde Supabase');
     }else{
       await syncBranchToSupabase({silent:true});
     }
