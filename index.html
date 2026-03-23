@@ -1378,6 +1378,10 @@ let settings={};
 let adminAuth={granted:false,branch:null};
 let cloudBootstrapping=false;
 const cloudSyncTimers={};
+const cloudRetryTimers={};
+const LOCAL_BRANCH_STATE_KEY='meridian_branch_state_v1';
+let lastLocalMutationAt=0;
+let lastCloudSyncAt=0;
 
 const fmt=n=>'$'+Math.round(n).toLocaleString('es-CL');
 const fmt2=(n,dec=0)=>'$'+n.toFixed(dec).replace(/\B(?=(\d{3})+(?!\d))/g,'.');
@@ -1672,6 +1676,7 @@ function setSchedule(empId,key,shiftCode){
 
 function createEmptyBranchState(branch=selectedBranch){
   return{
+    _meta:{updatedAt:null},
     prods:[],
     employees:[],
     salesLog:[],
@@ -1696,18 +1701,58 @@ function createEmptyBranchState(branch=selectedBranch){
 }
 const BRANCH_STATE=Object.fromEntries(BRANCHES.map(b=>[b,createEmptyBranchState(b)]));
 
-function queueCloudSync(branch=selectedBranch,delay=1200){
-  if(!supabaseClient||!branch)return;
+function persistBranchStateLocal(){
+  try{
+    localStorage.setItem(LOCAL_BRANCH_STATE_KEY,JSON.stringify(BRANCH_STATE));
+  }catch(e){}
+}
+function hydrateBranchStateLocal(){
+  const raw=localStorage.getItem(LOCAL_BRANCH_STATE_KEY);
+  if(!raw)return false;
+  try{
+    const parsed=JSON.parse(raw)||{};
+    let loaded=false;
+    BRANCHES.forEach(branch=>{
+      const st=parsed[branch];
+      if(!st||typeof st!=='object')return;
+      BRANCH_STATE[branch]=deep({...createEmptyBranchState(branch),...st});
+      loaded=true;
+    });
+    return loaded;
+  }catch(e){
+    return false;
+  }
+}
+function scheduleCloudRetry(branch,attempt=1){
+  if(!branch||cloudRetryTimers[branch])return;
+  const wait=Math.min(60000,Math.max(5000,attempt*5000));
+  cloudRetryTimers[branch]=setTimeout(async()=>{
+    delete cloudRetryTimers[branch];
+    const ok=await syncBranchToSupabase({branch,silent:true,skipSave:true,retry:false});
+    if(!ok)scheduleCloudRetry(branch,attempt+1);
+  },wait);
+}
+function clearCloudRetry(branch){
+  if(!cloudRetryTimers[branch])return;
+  clearTimeout(cloudRetryTimers[branch]);
+  delete cloudRetryTimers[branch];
+}
+function queueCloudSync(branch=selectedBranch,delay=450){
+  if(!branch)return;
+  if(!supabaseClient)connectSupabase({silent:true});
   if(cloudSyncTimers[branch])clearTimeout(cloudSyncTimers[branch]);
   cloudSyncTimers[branch]=setTimeout(async()=>{
     delete cloudSyncTimers[branch];
-    await syncBranchToSupabase({branch,silent:true,skipSave:true});
+    const ok=await syncBranchToSupabase({branch,silent:true,skipSave:true,retry:false});
+    if(!ok)scheduleCloudRetry(branch,1);
   },delay);
 }
 function saveCurrentBranchState(opts={}){
   const branch=selectedBranch;
   const queueCloud=opts.queueCloud!==false;
+  const updatedAt=new Date().toISOString();
   BRANCH_STATE[branch]=deep({
+    _meta:{updatedAt},
     prods:PRODS,
     employees:EMPLOYEES,
     salesLog,
@@ -1729,6 +1774,8 @@ function saveCurrentBranchState(opts={}){
     shiftSession,
     shiftClosures,
   });
+  lastLocalMutationAt=Date.now();
+  persistBranchStateLocal();
   if(queueCloud)queueCloudSync(branch);
 }
 function loadBranchState(branch,silent=false){
@@ -2010,28 +2057,87 @@ function connectSupabase(opts={}){
     return false;
   }
 }
+function getSupabaseRestHeaders(){
+  return{
+    apikey:supabaseCfg.anonKey,
+    Authorization:`Bearer ${supabaseCfg.anonKey}`,
+    'Content-Type':'application/json',
+  };
+}
+async function upsertBranchStateByRest(branch,payload,keepalive=false){
+  if(!(supabaseCfg.url&&supabaseCfg.anonKey))return{ok:false,error:'Supabase incompleto'};
+  const base=supabaseCfg.url.replace(/\/+$/,'');
+  const url=`${base}/rest/v1/branch_state?on_conflict=branch`;
+  try{
+    const res=await fetch(url,{
+      method:'POST',
+      headers:{...getSupabaseRestHeaders(),Prefer:'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify([{branch,payload,updated_at:new Date().toISOString()}]),
+      keepalive,
+    });
+    if(!res.ok){
+      const msg=await res.text().catch(()=>res.statusText||'Error HTTP');
+      return{ok:false,error:msg||res.statusText||'Error HTTP'};
+    }
+    return{ok:true};
+  }catch(err){
+    return{ok:false,error:String(err?.message||err)};
+  }
+}
+async function loadBranchStateByRest(branch){
+  if(!(supabaseCfg.url&&supabaseCfg.anonKey))return{ok:false,error:'Supabase incompleto',payload:null,missing:false};
+  const base=supabaseCfg.url.replace(/\/+$/,'');
+  const b=encodeURIComponent(branch);
+  const url=`${base}/rest/v1/branch_state?branch=eq.${b}&select=payload&limit=1`;
+  try{
+    const res=await fetch(url,{method:'GET',headers:getSupabaseRestHeaders()});
+    if(!res.ok){
+      const msg=await res.text().catch(()=>res.statusText||'Error HTTP');
+      return{ok:false,error:msg||res.statusText||'Error HTTP',payload:null,missing:false};
+    }
+    const rows=await res.json().catch(()=>[]);
+    const payload=rows?.[0]?.payload??null;
+    return{ok:true,payload,missing:!payload};
+  }catch(err){
+    return{ok:false,error:String(err?.message||err),payload:null,missing:false};
+  }
+}
 async function syncBranchToSupabase(opts={}){
   const branch=opts.branch||selectedBranch;
   const silent=opts.silent===true;
   const skipSave=opts.skipSave===true;
-  if(!supabaseClient){
-    const ok=connectSupabase({silent:true});
-    if(!ok){
-      if(!silent)notify('Sync pendiente','warning','No se pudo conectar a Supabase');
-      return false;
-    }
-  }
+  const retry=opts.retry!==false;
+  const keepalive=opts.keepalive===true;
+  if(!supabaseClient)connectSupabase({silent:true});
   if(!skipSave)saveCurrentBranchState({queueCloud:false});
   const payload=deep(BRANCH_STATE[branch]||createEmptyBranchState(branch));
-  const {error}=await supabaseClient.from('branch_state').upsert({
-    branch,
-    payload,
-    updated_at:new Date().toISOString(),
-  },{onConflict:'branch'});
-  if(error){
-    if(!silent)notify('Error sync','error',error.message);
+  let ok=false;
+  let errMsg='';
+  if(supabaseClient){
+    try{
+      const {error}=await supabaseClient.from('branch_state').upsert({
+        branch,
+        payload,
+        updated_at:new Date().toISOString(),
+      },{onConflict:'branch'});
+      if(!error)ok=true;
+      else errMsg=error.message||'Error sync';
+    }catch(err){
+      errMsg=String(err?.message||err);
+    }
+  }
+  if(!ok){
+    const rest=await upsertBranchStateByRest(branch,payload,keepalive);
+    ok=rest.ok;
+    if(!ok)errMsg=rest.error||errMsg||'Error sync';
+  }
+  if(!ok){
+    if(retry)scheduleCloudRetry(branch,1);
+    if(!silent)notify('Error sync','error',errMsg);
     return false;
   }
+  clearCloudRetry(branch);
+  lastCloudSyncAt=Date.now();
   if(!silent)notify('Local sincronizado','success',branch);
   return true;
 }
@@ -2040,27 +2146,43 @@ async function loadBranchFromSupabase(opts={}){
   const silent=(typeof opts==='object'&&opts.silent===true);
   const notifyMissing=(typeof opts==='object')?(opts.notifyMissing!==false):true;
   const apply=(typeof opts==='object')?(opts.apply!==false):true;
-  if(!supabaseClient){
-    const ok=connectSupabase({silent:true});
-    if(!ok){
-      if(!silent)notify('Carga pendiente','warning','No se pudo conectar a Supabase');
-      return false;
+  if(!supabaseClient)connectSupabase({silent:true});
+  let payload=null;
+  let errMsg='';
+  let missing=false;
+  if(supabaseClient){
+    try{
+      const {data,error,status}=await supabaseClient.from('branch_state').select('payload').eq('branch',branch).maybeSingle();
+      if(error){
+        if(error.code==='PGRST116'||status===406)missing=true;
+        else errMsg=error.message||'Error carga';
+      }else{
+        payload=data?.payload??null;
+        missing=!payload;
+      }
+    }catch(err){
+      errMsg=String(err?.message||err);
     }
   }
-  const {data,error,status}=await supabaseClient.from('branch_state').select('payload').eq('branch',branch).maybeSingle();
-  if(error){
-    if(error.code==='PGRST116'||status===406){
-      if(!silent&&notifyMissing)notify('Sin datos remotos','warning',branch);
+  if((!payload&&!missing)||(!supabaseClient&&!payload)){
+    const rest=await loadBranchStateByRest(branch);
+    if(rest.ok){
+      payload=rest.payload;
+      missing=rest.missing;
+    }else{
+      errMsg=rest.error||errMsg||'Error carga';
+    }
+  }
+  if(!payload){
+    if(errMsg){
+      if(!silent)notify('Error carga','error',errMsg);
       return false;
     }
-    if(!silent)notify('Error carga','error',error.message);
-    return false;
-  }
-  if(!data?.payload){
     if(!silent&&notifyMissing)notify('Sin datos remotos','warning',branch);
     return false;
   }
-  BRANCH_STATE[branch]=deep(data.payload);
+  BRANCH_STATE[branch]=deep({...createEmptyBranchState(branch),...payload});
+  persistBranchStateLocal();
   if(apply&&branch===selectedBranch)loadBranchState(branch,true);
   if(!silent)notify('Local descargado','success',branch);
   return true;
@@ -2074,6 +2196,19 @@ async function bootstrapBranchesFromSupabase(){
   if(!loaded)return false;
   loadBranchState(selectedBranch,true);
   return true;
+}
+function flushCloudSyncOnUnload(){
+  saveCurrentBranchState({queueCloud:false});
+  if(!(supabaseCfg.url&&supabaseCfg.anonKey))return;
+  const targets=new Set([selectedBranch,...Object.keys(cloudSyncTimers)]);
+  targets.forEach(branch=>{
+    if(cloudSyncTimers[branch]){
+      clearTimeout(cloudSyncTimers[branch]);
+      delete cloudSyncTimers[branch];
+    }
+    const payload=deep(BRANCH_STATE[branch]||createEmptyBranchState(branch));
+    upsertBranchStateByRest(branch,payload,true);
+  });
 }
 
 function syncCats(){
@@ -4366,6 +4501,7 @@ async function init(){
       if(parsed.url&&parsed.anonKey)supabaseCfg=parsed;
     }catch(e){}
   }
+  hydrateBranchStateLocal();
   hydrateSupabaseInputs();
   const connected=connectSupabase({silent:true});
   document.getElementById('branchSel').value=selectedBranch;
@@ -4388,7 +4524,12 @@ async function init(){
   updateShiftButton();
   renderAdminMobileCards();
   window.addEventListener('resize',renderAdminMobileCards);
-  window.addEventListener('beforeunload',()=>saveCurrentBranchState({queueCloud:false}));
+  window.addEventListener('beforeunload',flushCloudSyncOnUnload);
+  setInterval(()=>{
+    if(lastLocalMutationAt>lastCloudSyncAt){
+      syncBranchToSupabase({silent:true,skipSave:true,retry:false});
+    }
+  },30000);
   if(BGEV.length)setTimeout(runBgEvents,12000);
 }
 init();
