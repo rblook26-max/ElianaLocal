@@ -1376,6 +1376,8 @@ const DEFAULT_SUPABASE_CFG={
 let supabaseCfg={...DEFAULT_SUPABASE_CFG};
 let settings={};
 let adminAuth={granted:false,branch:null};
+let cloudBootstrapping=false;
+const cloudSyncTimers={};
 
 const fmt=n=>'$'+Math.round(n).toLocaleString('es-CL');
 const fmt2=(n,dec=0)=>'$'+n.toFixed(dec).replace(/\B(?=(\d{3})+(?!\d))/g,'.');
@@ -1694,8 +1696,18 @@ function createEmptyBranchState(branch=selectedBranch){
 }
 const BRANCH_STATE=Object.fromEntries(BRANCHES.map(b=>[b,createEmptyBranchState(b)]));
 
-function saveCurrentBranchState(){
-  BRANCH_STATE[selectedBranch]=deep({
+function queueCloudSync(branch=selectedBranch,delay=1200){
+  if(!supabaseClient||!branch)return;
+  if(cloudSyncTimers[branch])clearTimeout(cloudSyncTimers[branch]);
+  cloudSyncTimers[branch]=setTimeout(async()=>{
+    delete cloudSyncTimers[branch];
+    await syncBranchToSupabase({branch,silent:true,skipSave:true});
+  },delay);
+}
+function saveCurrentBranchState(opts={}){
+  const branch=selectedBranch;
+  const queueCloud=opts.queueCloud!==false;
+  BRANCH_STATE[branch]=deep({
     prods:PRODS,
     employees:EMPLOYEES,
     salesLog,
@@ -1717,6 +1729,7 @@ function saveCurrentBranchState(){
     shiftSession,
     shiftClosures,
   });
+  if(queueCloud)queueCloudSync(branch);
 }
 function loadBranchState(branch,silent=false){
   const st=BRANCH_STATE[branch]||createEmptyBranchState(branch);
@@ -1753,11 +1766,20 @@ function loadBranchState(branch,silent=false){
   refreshAllViews();
   if(!silent)notify('Local activo','info',`Mostrando ${selectedBranch}`);
 }
-function changeBranch(branch){
+async function changeBranch(branch){
   if(!branch||branch===selectedBranch)return;
   const wasAdmin=document.getElementById('viewADMIN')?.classList.contains('on');
+  const prevBranch=selectedBranch;
   saveCurrentBranchState();
-  loadBranchState(branch);
+  await syncBranchToSupabase({branch:prevBranch,silent:true,skipSave:true});
+  loadBranchState(branch,true);
+  cloudBootstrapping=true;
+  try{
+    await loadBranchFromSupabase({branch,silent:true,notifyMissing:false,apply:true});
+  }finally{
+    cloudBootstrapping=false;
+  }
+  notify('Local activo','info',`Mostrando ${selectedBranch}`);
   if(wasAdmin){
     setView('POS');
     setMobBtn('mobPOS');
@@ -1920,7 +1942,7 @@ function renderConfigPanel(){
       <div class="trow"><div class="ti-info"><div class="ti-t">Calcular HHEE desde asistencia</div></div><input type="checkbox" id="cfgAttOt" ${chk(e.autoOvertimeFromAttendance)}></div>
     </div>`;
 }
-function saveConfig(){
+async function saveConfig(){
   ensureSettings();
   captureConfigFromDom();
   let adminPwdChanged=false;
@@ -1950,6 +1972,8 @@ function saveConfig(){
   applyPaymentConfig();
   checkTheftAlerts();
   saveCurrentBranchState();
+  const synced=await syncBranchToSupabase({silent:true});
+  if(!synced)notify('Sync pendiente','warning','No se pudo guardar en nube en este momento');
   refreshAllViews();
   if(adminPwdChanged){
     setView('POS');
@@ -1968,38 +1992,88 @@ function hydrateSupabaseInputs(){
   document.getElementById('sbUrl')&&(document.getElementById('sbUrl').value=supabaseCfg.url||'');
   document.getElementById('sbKey')&&(document.getElementById('sbKey').value=supabaseCfg.anonKey||'');
 }
-function connectSupabase(){
+function connectSupabase(opts={}){
+  const silent=opts.silent===true;
   const cfg=readSupabaseInputs();
-  if(!(cfg.url&&cfg.anonKey)){notify('Supabase incompleto','warning','Falta URL o Anon Key');return;}
+  if(!(cfg.url&&cfg.anonKey)){
+    if(!silent)notify('Supabase incompleto','warning','Falta URL o Anon Key');
+    return false;
+  }
   try{
     supabaseClient=window.supabase.createClient(cfg.url,cfg.anonKey);
     supabaseCfg=cfg;
     localStorage.setItem('meridian_supabase_cfg',JSON.stringify(cfg));
-    notify('Supabase conectado','success','Cliente listo para sincronizar');
+    if(!silent)notify('Supabase conectado','success','Cliente listo para sincronizar');
+    return true;
   }catch(err){
-    notify('Error Supabase','error',String(err.message||err));
+    if(!silent)notify('Error Supabase','error',String(err.message||err));
+    return false;
   }
 }
-async function syncBranchToSupabase(){
-  if(!supabaseClient){connectSupabase();if(!supabaseClient)return;}
-  saveCurrentBranchState();
-  const payload=deep(BRANCH_STATE[selectedBranch]);
+async function syncBranchToSupabase(opts={}){
+  const branch=opts.branch||selectedBranch;
+  const silent=opts.silent===true;
+  const skipSave=opts.skipSave===true;
+  if(!supabaseClient){
+    const ok=connectSupabase({silent:true});
+    if(!ok){
+      if(!silent)notify('Sync pendiente','warning','No se pudo conectar a Supabase');
+      return false;
+    }
+  }
+  if(!skipSave)saveCurrentBranchState({queueCloud:false});
+  const payload=deep(BRANCH_STATE[branch]||createEmptyBranchState(branch));
   const {error}=await supabaseClient.from('branch_state').upsert({
-    branch:selectedBranch,
+    branch,
     payload,
     updated_at:new Date().toISOString(),
   },{onConflict:'branch'});
-  if(error){notify('Error sync','error',error.message);return;}
-  notify('Local sincronizado','success',selectedBranch);
+  if(error){
+    if(!silent)notify('Error sync','error',error.message);
+    return false;
+  }
+  if(!silent)notify('Local sincronizado','success',branch);
+  return true;
 }
-async function loadBranchFromSupabase(){
-  if(!supabaseClient){connectSupabase();if(!supabaseClient)return;}
-  const {data,error}=await supabaseClient.from('branch_state').select('payload').eq('branch',selectedBranch).single();
-  if(error){notify('Error carga','error',error.message);return;}
-  if(!data?.payload){notify('Sin datos remotos','warning',selectedBranch);return;}
-  BRANCH_STATE[selectedBranch]=deep(data.payload);
+async function loadBranchFromSupabase(opts={}){
+  const branch=(typeof opts==='string')?opts:(opts.branch||selectedBranch);
+  const silent=(typeof opts==='object'&&opts.silent===true);
+  const notifyMissing=(typeof opts==='object')?(opts.notifyMissing!==false):true;
+  const apply=(typeof opts==='object')?(opts.apply!==false):true;
+  if(!supabaseClient){
+    const ok=connectSupabase({silent:true});
+    if(!ok){
+      if(!silent)notify('Carga pendiente','warning','No se pudo conectar a Supabase');
+      return false;
+    }
+  }
+  const {data,error,status}=await supabaseClient.from('branch_state').select('payload').eq('branch',branch).maybeSingle();
+  if(error){
+    if(error.code==='PGRST116'||status===406){
+      if(!silent&&notifyMissing)notify('Sin datos remotos','warning',branch);
+      return false;
+    }
+    if(!silent)notify('Error carga','error',error.message);
+    return false;
+  }
+  if(!data?.payload){
+    if(!silent&&notifyMissing)notify('Sin datos remotos','warning',branch);
+    return false;
+  }
+  BRANCH_STATE[branch]=deep(data.payload);
+  if(apply&&branch===selectedBranch)loadBranchState(branch,true);
+  if(!silent)notify('Local descargado','success',branch);
+  return true;
+}
+async function bootstrapBranchesFromSupabase(){
+  if(!supabaseClient)return false;
+  let loaded=0;
+  for(const branch of BRANCHES){
+    if(await loadBranchFromSupabase({branch,silent:true,notifyMissing:false,apply:false}))loaded++;
+  }
+  if(!loaded)return false;
   loadBranchState(selectedBranch,true);
-  notify('Local descargado','success',selectedBranch);
+  return true;
 }
 
 function syncCats(){
@@ -2195,7 +2269,7 @@ function confirmAdminAccess(){
   closeModal();
   setView('ADMIN');
 }
-function createAdminAccess(){
+async function createAdminAccess(){
   ensureSettings();
   const p1=(document.getElementById('adminPassNewIn')?.value||'').trim();
   const p2=(document.getElementById('adminPassConfirmIn')?.value||'').trim();
@@ -2203,6 +2277,8 @@ function createAdminAccess(){
   if(p1!==p2){notify('No coincide','error','La confirmación de contraseña no coincide');return;}
   settings.general.adminPassHash=hashAdminPassword(p1);
   saveCurrentBranchState();
+  const synced=await syncBranchToSupabase({silent:true});
+  if(!synced)notify('Sync pendiente','warning','La contraseña quedó local; reintenta sincronizar');
   adminAuth={granted:true,branch:selectedBranch};
   closeModal();
   setView('ADMIN');
@@ -2210,6 +2286,10 @@ function createAdminAccess(){
 }
 function goView(v){
   if(v==='ADMIN'){
+    if(cloudBootstrapping){
+      notify('Sincronizando local','info','Espera unos segundos antes de entrar a Administración');
+      return false;
+    }
     ensureSettings();
     if(!(adminAuth.granted&&adminAuth.branch===selectedBranch)){
       openAdminAccessModal();
@@ -4278,7 +4358,7 @@ function saveProduct(){
 }
 
 /* ─── INIT ─── */
-function init(){
+async function init(){
   const cfg=localStorage.getItem('meridian_supabase_cfg');
   if(cfg){
     try{
@@ -4287,14 +4367,28 @@ function init(){
     }catch(e){}
   }
   hydrateSupabaseInputs();
-  connectSupabase();
+  const connected=connectSupabase({silent:true});
   document.getElementById('branchSel').value=selectedBranch;
   loadBranchState(selectedBranch,true);
+  if(connected){
+    let loaded=false;
+    cloudBootstrapping=true;
+    try{
+      loaded=await bootstrapBranchesFromSupabase();
+    }finally{
+      cloudBootstrapping=false;
+    }
+    if(loaded){
+      notify('Datos cargados','success','Estado del local sincronizado desde Supabase');
+    }else{
+      await syncBranchToSupabase({silent:true});
+    }
+  }
   buildTicker();
   updateShiftButton();
   renderAdminMobileCards();
   window.addEventListener('resize',renderAdminMobileCards);
-  window.addEventListener('beforeunload',saveCurrentBranchState);
+  window.addEventListener('beforeunload',()=>saveCurrentBranchState({queueCloud:false}));
   if(BGEV.length)setTimeout(runBgEvents,12000);
 }
 init();
